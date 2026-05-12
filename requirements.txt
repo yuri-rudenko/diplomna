@@ -1,0 +1,11 @@
+nilearn>=0.10.4
+nibabel>=5.2
+numpy>=1.26
+pandas>=2.2
+matplotlib>=3.8
+seaborn>=0.13
+scikit-learn>=1.5
+plotly>=6.0
+umap-learn>=0.5
+torch>=1.13
+kaleido>=0.2.1
