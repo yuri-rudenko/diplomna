@@ -60,9 +60,9 @@ def make_cv_splits(
 
 
 def save_splits(folds: list[tuple[np.ndarray, np.ndarray]]) -> Path:
-    """Save folds to data/processed/splits.npz."""
+    """Save folds to data/processed/splits.npz (includes n_splits for mismatch detection)."""
     out = PROCESSED_DIR / "splits.npz"
-    payload = {}
+    payload: dict = {"n_splits": np.array([len(folds)])}
     for k, (tr, te) in enumerate(folds):
         payload[f"train_{k}"] = tr
         payload[f"test_{k}"] = te
@@ -72,8 +72,33 @@ def save_splits(folds: list[tuple[np.ndarray, np.ndarray]]) -> Path:
 
 
 def load_splits(n_splits: int = 5) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Load previously saved splits."""
-    data = np.load(PROCESSED_DIR / "splits.npz")
+    """Load previously saved splits, auto-creating them if splits.npz is missing."""
+    splits_path = PROCESSED_DIR / "splits.npz"
+
+    if not splits_path.exists():
+        pheno_path = PROCESSED_DIR / "phenotype.csv"
+        if not pheno_path.exists():
+            raise FileNotFoundError(
+                f"Neither splits.npz nor phenotype.csv found in {PROCESSED_DIR}.\n"
+                "Run: python -m src.data.download_abide"
+            )
+        print(f"  [splits] splits.npz not found — creating {n_splits}-fold splits ...")
+        pheno = pd.read_csv(pheno_path)
+        folds = make_cv_splits(pheno, n_splits=n_splits)
+        save_splits(folds)
+
+    data = np.load(splits_path)
+
+    # Detect n_splits mismatch between saved file and requested
+    if "n_splits" in data:
+        saved_n = int(data["n_splits"][0])
+        if saved_n != n_splits:
+            raise ValueError(
+                f"splits.npz was created with n_splits={saved_n} "
+                f"but load_splits(n_splits={n_splits}) was called.\n"
+                f"Delete {splits_path} and rerun to regenerate with n_splits={n_splits}."
+            )
+
     return [(data[f"train_{k}"], data[f"test_{k}"]) for k in range(n_splits)]
 
 

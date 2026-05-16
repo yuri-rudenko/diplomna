@@ -19,12 +19,14 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.data.dataset import mixup_batch
 from src.training.schedules import beta_schedule, cls_weight_schedule
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -42,15 +44,35 @@ def _forward_loss(
     beta: float,
     cls_weight: float,
     recon_weight: float = 1.0,
+    label_smoothing: float = 0.1,
+    y_batch_b: torch.Tensor | None = None,
+    mixup_lam: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass + loss. Supports mixup (y_batch_b, mixup_lam) and label smoothing."""
     if model_type == "sae":
         x_recon, z, logits = model(X_batch)
-        total, *_ = model.loss(X_batch, x_recon, z, logits, y_batch,
-                               recon_weight=recon_weight, cls_weight=cls_weight)
+        recon_loss = F.mse_loss(x_recon, X_batch)
+        sp_loss = model.sparse_loss(z)
+        if cls_weight > 0:
+            cls_a = F.cross_entropy(logits, y_batch, label_smoothing=label_smoothing)
+            cls_b = F.cross_entropy(logits, y_batch_b, label_smoothing=label_smoothing) \
+                    if y_batch_b is not None else cls_a
+            cls_loss = mixup_lam * cls_a + (1 - mixup_lam) * cls_b
+        else:
+            cls_loss = torch.tensor(0.0, device=X_batch.device)
+        total = recon_weight * recon_loss + cls_weight * cls_loss + model.sparsity_weight * sp_loss
     else:
         x_recon, mu, logvar, z, logits = model(X_batch)
-        total, *_ = model.loss(X_batch, x_recon, mu, logvar, logits, y_batch,
-                               beta=beta, recon_weight=recon_weight, cls_weight=cls_weight)
+        recon_loss = F.mse_loss(x_recon, X_batch, reduction="mean")
+        kl_loss = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+        if cls_weight > 0:
+            cls_a = F.cross_entropy(logits, y_batch, label_smoothing=label_smoothing)
+            cls_b = F.cross_entropy(logits, y_batch_b, label_smoothing=label_smoothing) \
+                    if y_batch_b is not None else cls_a
+            cls_loss = mixup_lam * cls_a + (1 - mixup_lam) * cls_b
+        else:
+            cls_loss = torch.tensor(0.0, device=X_batch.device)
+        total = recon_weight * recon_loss + beta * kl_loss + cls_weight * cls_loss
     return total, logits
 
 
@@ -63,6 +85,9 @@ def train_one_epoch(
     beta: float,
     cls_weight: float,
     epoch_bar: tqdm,
+    use_mixup: bool = True,
+    mixup_alpha: float = 0.2,
+    label_smoothing: float = 0.1,
 ) -> tuple[float, float]:
     model.train()
     total_loss = correct = n = 0
@@ -70,7 +95,17 @@ def train_one_epoch(
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
-        loss, logits = _forward_loss(model, X_batch, y_batch, model_type, beta, cls_weight)
+
+        # Mixup only in joint phase when cls_weight > 0
+        y_b, lam = None, 1.0
+        if use_mixup and cls_weight > 0 and mixup_alpha > 0:
+            X_batch, y_batch, y_b, lam = mixup_batch(X_batch, y_batch, mixup_alpha)
+            y_b = y_b.to(device)
+
+        loss, logits = _forward_loss(
+            model, X_batch, y_batch, model_type, beta, cls_weight,
+            label_smoothing=label_smoothing, y_batch_b=y_b, mixup_lam=lam,
+        )
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -79,7 +114,7 @@ def train_one_epoch(
         correct += (logits.argmax(1) == y_batch).sum().item()
         n += len(y_batch)
 
-        epoch_bar.set_postfix(loss=f"{total_loss/( epoch_bar.n or 1):.4f}", refresh=False)
+        epoch_bar.set_postfix(loss=f"{total_loss/(epoch_bar.n or 1):.4f}", refresh=False)
 
     return total_loss / len(loader), correct / n
 
@@ -138,14 +173,21 @@ def train_model(
     cls_weight_max: float = 5.0,
     kl_warmup_epochs: int = 30,
     verbose: bool = True,
+    use_mixup: bool = True,
+    mixup_alpha: float = 0.2,
+    label_smoothing: float = 0.1,
 ) -> dict[str, list]:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = model.to(device)
 
+    # Clamp so phase1/warmup never eat all of n_epochs; preserve the 20% ratio for short runs
+    phase1_epochs = min(phase1_epochs, max(1, round(n_epochs * 0.2)))
+    kl_warmup_epochs = min(kl_warmup_epochs, n_epochs)
+
     def _make_optimizer():
-        return Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     optimizer = _make_optimizer()
     # Phase 1: CosineAnnealing for recon warmup
@@ -186,6 +228,8 @@ def train_model(
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, device, model_type,
             beta=beta, cls_weight=cw, epoch_bar=epoch_bar,
+            use_mixup=use_mixup, mixup_alpha=mixup_alpha,
+            label_smoothing=label_smoothing,
         )
         val_metrics = evaluate(model, val_loader, device, model_type)
 

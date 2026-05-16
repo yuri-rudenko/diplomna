@@ -106,10 +106,77 @@ def download_and_build_fc(n_subjects: int | None = None) -> tuple[np.ndarray, pd
     np.save(PROCESSED_DIR / "fc_matrices.npy", X)
     pheno.to_csv(PROCESSED_DIR / "phenotype.csv", index=False)
 
-    n_asd = pheno["label"].sum()
-    print(f"\nDone — {len(X)} subjects  |  ASD: {n_asd}  |  Control: {len(X) - n_asd}")
+    n_asd = int(pheno["label"].sum())
+    n_ctrl = int((pheno["label"] == 0).sum())
+    print(f"\nDone — {len(X)} subjects  |  ASD: {n_asd}  |  Control: {n_ctrl}")
     print(f"Sites ({pheno['site'].nunique()}): {sorted(pheno['site'].unique())}")
+
+    # Save dataset statistics for the report
+    _save_dataset_stats(X, pheno)
+
+    # Auto-create 5-fold splits so downstream code never fails on missing splits.npz
+    try:
+        from src.data.splits import make_cv_splits, save_splits
+        print("\n[+] Auto-creating 5-fold CV splits ...")
+        folds = make_cv_splits(pheno, n_splits=5)
+        save_splits(folds)
+    except Exception as e:
+        print(f"  [warn] Could not auto-create splits: {e}")
+        print("  Run manually: python -m src.data.splits")
+
     return X, pheno
+
+
+def _save_dataset_stats(X: np.ndarray, pheno: pd.DataFrame) -> None:
+    """Compute and save dataset_stats.json for the diploma report."""
+    import json
+
+    y = pheno["label"]
+    age = pheno["age"]
+
+    def age_stats(mask) -> dict:
+        a = age[mask].dropna()
+        return {
+            "mean": round(float(a.mean()), 2),
+            "std":  round(float(a.std()),  2),
+            "min":  round(float(a.min()),  2),
+            "max":  round(float(a.max()),  2),
+            "n":    int(a.notna().sum()),
+        }
+
+    site_table: dict = {}
+    for site in sorted(pheno["site"].unique()):
+        mask = pheno["site"] == site
+        site_table[site] = {
+            "total":   int(mask.sum()),
+            "asd":     int((y[mask] == 1).sum()),
+            "control": int((y[mask] == 0).sum()),
+        }
+
+    stats = {
+        "n_total":        int(len(X)),
+        "n_asd":          int((y == 1).sum()),
+        "n_control":      int((y == 0).sum()),
+        "n_sites":        int(pheno["site"].nunique()),
+        "sites":          sorted(pheno["site"].unique().tolist()),
+        "site_table":     site_table,
+        "fc_shape":       list(X.shape),       # [N, 200, 200]
+        "n_features":     int(200 * 199 // 2), # 19900 upper-triangle
+        "age_all":        age_stats(slice(None)),
+        "age_asd":        age_stats(y == 1),
+        "age_control":    age_stats(y == 0),
+        "sex_total_male":     int((pheno["sex"] == 1).sum()),
+        "sex_total_female":   int((pheno["sex"] == 2).sum()),
+        "sex_asd_male":       int(((y == 1) & (pheno["sex"] == 1)).sum()),
+        "sex_asd_female":     int(((y == 1) & (pheno["sex"] == 2)).sum()),
+        "sex_control_male":   int(((y == 0) & (pheno["sex"] == 1)).sum()),
+        "sex_control_female": int(((y == 0) & (pheno["sex"] == 2)).sum()),
+    }
+
+    out = PROCESSED_DIR / "dataset_stats.json"
+    with open(out, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Dataset stats saved → {out}")
 
 
 def load_processed() -> tuple[np.ndarray, pd.DataFrame]:

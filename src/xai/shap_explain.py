@@ -19,6 +19,7 @@ import argparse
 import warnings
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -27,7 +28,8 @@ import torch.nn as nn
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
-CKPT_DIR = PROJECT_DIR / "results" / "checkpoints"
+CKPT_DIR = PROJECT_DIR / "results" / "checkpoints"           # compare_models.py path
+EXPERIMENTS_DIR = PROJECT_DIR / "results" / "experiments"    # run_experiments.py path
 FIGURES_DIR = PROJECT_DIR / "results" / "figures"
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -94,21 +96,25 @@ def explain_model(
     fold: str = "best",
     n_background: int = 100,
     device: torch.device | None = None,
+    exp_name: str | None = None,
+    harmonize: bool = False,
 ) -> dict:
     """
     Run SHAP explanation on a trained model.
 
     Parameters
     ----------
-    model_type : 'sae' | 'vae' | 'attention_vae'
-    fold       : 'best' (pick fold with highest AUC) or int fold index
+    model_type  : 'sae' | 'vae' | 'attention_vae'
+    fold        : 'best' (pick fold with highest AUC) or int fold index
+    exp_name    : experiment name from run_experiments.py (e.g. 'aug_full')
+    harmonize   : apply ComBat before scaling — must match what was done during training
     """
     import shap
 
     from src.data.download_abide import load_processed
     from src.data.splits import load_splits
     from src.data.preprocessing import apply_scaler, fit_scaler, vectorize
-    from src.data.harmonize import apply_combat, fit_combat
+    from src.data.harmonize import fit_and_apply_combat
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,7 +124,7 @@ def explain_model(
 
     # Pick fold
     if fold == "best":
-        fold_idx = _best_fold(model_type)
+        fold_idx = _best_fold(model_type, exp_name=exp_name)
     else:
         fold_idx = int(fold)
 
@@ -130,26 +136,45 @@ def explain_model(
     X_train_vec = vectorize(X_train_raw)
     X_test_vec = vectorize(X_test_raw)
 
-    # ComBat
-    try:
-        sites_tr = pheno["site"].values[train_idx]
-        sites_te = pheno["site"].values[test_idx]
-        X_train_vec, combat_params = fit_combat(
-            X_train_vec, sites_tr,
-            pheno["age"].values[train_idx], pheno["sex"].values[train_idx]
-        )
-        X_test_vec = apply_combat(
-            combat_params, X_test_vec, sites_te,
-            pheno["age"].values[test_idx], pheno["sex"].values[test_idx]
-        )
-    except ImportError:
-        print("  [warn] neuroCombat not available — skipping harmonization")
+    # ComBat — only if the experiment used harmonization (must match training)
+    if harmonize:
+        try:
+            sites_tr = pheno["site"].values[train_idx]
+            sites_te = pheno["site"].values[test_idx]
+            X_train_vec, X_test_vec = fit_and_apply_combat(
+                X_train_vec, X_test_vec,
+                sites_tr, sites_te,
+                pheno["age"].values[train_idx], pheno["age"].values[test_idx],
+                pheno["sex"].values[train_idx], pheno["sex"].values[test_idx],
+            )
+            print("  [combat] harmonization applied")
+        except Exception as e:
+            print(f"  [warn] ComBat skipped: {e}")
+    else:
+        print("  [combat] skipped (harmonize=False — matches training)")
 
-    scaler = fit_scaler(X_train_vec)
+    # Load saved scaler — try experiment dir first, then compare_models path, else refit
+    _scaler_candidates = []
+    if exp_name:
+        _scaler_candidates.append(
+            EXPERIMENTS_DIR / exp_name / "checkpoints" / f"scaler_fold{fold_idx}.pkl"
+        )
+    _scaler_candidates.append(
+        PROJECT_DIR / "data" / "processed" / f"scaler_fold{fold_idx}.pkl"
+    )
+    scaler = None
+    for _sp in _scaler_candidates:
+        if _sp.exists():
+            scaler = joblib.load(_sp)
+            print(f"  Loaded scaler from {_sp}")
+            break
+    if scaler is None:
+        print("  [warn] No saved scaler found — refitting on train split")
+        scaler = fit_scaler(X_train_vec)
     X_train_n, X_test_n = apply_scaler(scaler, X_train_vec, X_test_vec)
 
     # Load model
-    model = _load_model(model_type, fold_idx, device)
+    model = _load_model(model_type, fold_idx, device, exp_name=exp_name)
     wrapper = _ASDProbWrapper(model, model_type).to(device)
     wrapper.eval()
 
@@ -187,12 +212,16 @@ def explain_model(
     np.save(FIGURES_DIR / f"roi_importance_{tag}.npy", mean_roi_importance)
 
     top20_idx = np.argsort(mean_roi_importance)[::-1][:20]
+
+    # Annotate with Yeo-7 network names (uses CC200→Schaefer mapping)
+    roi_networks = _get_cc200_networks()  # list of 200 strings
     top20_df = pd.DataFrame({
         "rank": range(1, 21),
         "roi_index": top20_idx,
+        "yeo7_network": [roi_networks[i] for i in top20_idx],
         "mean_abs_shap": mean_roi_importance[top20_idx],
     })
-    top20_path = FIGURES_DIR / "shap_top20_table.csv"
+    top20_path = FIGURES_DIR / f"shap_top20_{tag}.csv"
     top20_df.to_csv(top20_path, index=False)
 
     print(f"\nTop-20 ROIs by |SHAP|:")
@@ -207,21 +236,73 @@ def explain_model(
     }
 
 
-def _best_fold(model_type: str) -> int:
-    """Return fold index with highest test AUC from cv_per_fold.csv."""
-    metrics_path = PROJECT_DIR / "results" / "metrics" / "cv_per_fold.csv"
-    if not metrics_path.exists():
-        print("  [warn] cv_per_fold.csv not found — using fold 0")
-        return 0
-    df = pd.read_csv(metrics_path)
-    subset = df[df["model"] == model_type]
-    if subset.empty:
-        return 0
-    return int(subset.loc[subset["auc"].idxmax(), "fold"])
+_CC200_NETWORKS_CACHE: list[str] | None = None
+
+def _get_cc200_networks() -> list[str]:
+    """Return list of 200 Yeo-7 network names for CC200 ROIs (cached)."""
+    global _CC200_NETWORKS_CACHE
+    if _CC200_NETWORKS_CACHE is not None:
+        return _CC200_NETWORKS_CACHE
+
+    # Cache file so we don't recompute every run
+    cache_path = PROJECT_DIR / "data" / "processed" / "cc200_networks.json"
+    if cache_path.exists():
+        import json
+        with open(cache_path) as f:
+            _CC200_NETWORKS_CACHE = json.load(f)
+        return _CC200_NETWORKS_CACHE
+
+    try:
+        print("  Building CC200→Yeo-7 network mapping (one-time, ~30s) ...")
+        from src.visualize_networks_sorted import build_cc200_to_network
+        networks = build_cc200_to_network()
+        import json
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(networks, f)
+        _CC200_NETWORKS_CACHE = networks
+        return networks
+    except Exception as e:
+        print(f"  [warn] Could not build CC200 network map: {e}")
+        _CC200_NETWORKS_CACHE = ["Unknown"] * 200
+        return _CC200_NETWORKS_CACHE
 
 
-def _load_model(model_type: str, fold_idx: int, device: torch.device):
-    """Load model from checkpoint."""
+def _best_fold(model_type: str, exp_name: str | None = None) -> int:
+    """Return fold index with highest test AUC from cv_per_fold.csv.
+
+    Checks experiment-specific metrics first, then falls back to compare_models.py path.
+    """
+    candidates = []
+    if exp_name:
+        candidates.append(EXPERIMENTS_DIR / exp_name / "metrics" / "cv_per_fold.csv")
+    candidates.append(PROJECT_DIR / "results" / "metrics" / "cv_per_fold.csv")
+
+    for metrics_path in candidates:
+        if not metrics_path.exists():
+            continue
+        df = pd.read_csv(metrics_path)
+        subset = df[df["model"] == model_type]
+        if subset.empty:
+            continue
+        return int(subset.loc[subset["auc"].idxmax(), "fold"])
+
+    print("  [warn] cv_per_fold.csv not found — using fold 0")
+    return 0
+
+
+def _load_model(
+    model_type: str,
+    fold_idx: int,
+    device: torch.device,
+    exp_name: str | None = None,
+):
+    """Load model from checkpoint.
+
+    Search order:
+      1. results/experiments/{exp_name}/checkpoints/{exp_name}_{model_type}_fold{k}_best_auc.pth
+      2. results/checkpoints/{model_type}_fold{k}_best_auc.pth  (compare_models.py path)
+    """
     from src.models.sparse_ae import SparseAutoencoder
     from src.models.vae import VariationalAutoencoder
     from src.models.attention_vae import AttentionVAE
@@ -232,18 +313,55 @@ def _load_model(model_type: str, fold_idx: int, device: torch.device):
         "attention_vae": AttentionVAE,
     }
     model = model_map[model_type]().to(device)
-    ckpt_path = CKPT_DIR / f"{model_type}_fold{fold_idx}_best_auc.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    candidates = []
+    if exp_name:
+        candidates.append(
+            EXPERIMENTS_DIR / exp_name / "checkpoints"
+            / f"{exp_name}_{model_type}_fold{fold_idx}_best_auc.pth"
+        )
+    candidates.append(CKPT_DIR / f"{model_type}_fold{fold_idx}_best_auc.pth")
+
+    ckpt_path = None
+    for c in candidates:
+        if c.exists():
+            ckpt_path = c
+            break
+
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f"Checkpoint not found. Tried:\n" + "\n".join(f"  {c}" for c in candidates)
+        )
+
+    print(f"  Loading checkpoint: {ckpt_path}")
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
     return model
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="attention_vae", choices=["sae", "vae", "attention_vae"])
-    parser.add_argument("--fold", default="best")
+    parser = argparse.ArgumentParser(
+        description="SHAP explanation for trained SAE/VAE/Attention-VAE"
+    )
+    parser.add_argument("--model", default="attention_vae",
+                        choices=["sae", "vae", "attention_vae"])
+    parser.add_argument("--fold", default="best",
+                        help="Fold index or 'best' (auto-selects highest AUC)")
     parser.add_argument("--n-background", type=int, default=100)
+    parser.add_argument(
+        "--exp", default=None,
+        help="Experiment name from run_experiments.py (e.g. aug_full). "
+             "Loads checkpoints from results/experiments/{exp}/checkpoints/",
+    )
+    parser.add_argument(
+        "--harmonize", action="store_true",
+        help="Apply ComBat before scaling (only if the experiment used harmonize=True)",
+    )
     args = parser.parse_args()
-    explain_model(model_type=args.model, fold=args.fold, n_background=args.n_background)
+    explain_model(
+        model_type=args.model,
+        fold=args.fold,
+        n_background=args.n_background,
+        exp_name=args.exp,
+        harmonize=args.harmonize,
+    )

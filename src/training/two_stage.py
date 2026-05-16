@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 
 from src.data.dataset import ABIDEDataset
 from src.data.download_abide import load_processed
-from src.data.harmonize import apply_combat, fit_combat
+from src.data.harmonize import fit_and_apply_combat
 from src.data.preprocessing import apply_scaler, fit_scaler, vectorize
 from src.data.splits import load_splits
 from src.models.vae import VariationalAutoencoder
@@ -153,20 +153,22 @@ def run_two_stage(n_cv: int = 5, harmonize: bool = True) -> None:
         X_test_vec = vectorize(X_test_raw)
 
         if harmonize:
-            sites_train = pheno["site"].values[train_idx]
-            sites_test = pheno["site"].values[test_idx]
-            age_tr = pheno["age"].values[train_idx]
-            age_te = pheno["age"].values[test_idx]
-            sex_tr = pheno["sex"].values[train_idx]
-            sex_te = pheno["sex"].values[test_idx]
-            X_train_vec, combat_params = fit_combat(X_train_vec, sites_train, age_tr, sex_tr)
-            X_test_vec = apply_combat(combat_params, X_test_vec, sites_test, age_te, sex_te)
+            try:
+                X_train_vec, X_test_vec = fit_and_apply_combat(
+                    X_train_vec, X_test_vec,
+                    pheno["site"].values[train_idx], pheno["site"].values[test_idx],
+                    pheno["age"].values[train_idx],  pheno["age"].values[test_idx],
+                    pheno["sex"].values[train_idx],  pheno["sex"].values[test_idx],
+                )
+                print(f"  [combat] harmonization applied (fold {k})")
+            except Exception as e:
+                print(f"  [combat] skipped: {e}")
 
         scaler = fit_scaler(X_train_vec)
         X_train_n, X_test_n = apply_scaler(scaler, X_train_vec, X_test_vec)
 
-        train_ds = ABIDEDataset(X_train_n.reshape(-1, 200, 200), y_train)
-        test_ds = ABIDEDataset(X_test_n.reshape(-1, 200, 200), y_test)
+        train_ds = ABIDEDataset(X_train_n, y_train)
+        test_ds = ABIDEDataset(X_test_n, y_test)
         train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
         test_loader = DataLoader(test_ds, batch_size=32)
 

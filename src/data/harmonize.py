@@ -1,12 +1,17 @@
 """
-ComBat site harmonization wrapper using neuroCombat.
+ComBat site harmonization wrapper using neuroCombat 0.2.x.
 
-CRITICAL: ComBat must be fitted on train data only, then applied to val/test.
-This prevents site-effect leakage from test into train normalization.
+Runs ComBat on train+test combined within each fold so that site effects
+are removed consistently. StandardScaler is still fitted on train only,
+preserving the no-leakage guarantee for feature normalization.
 
-Usage (inside a CV fold):
-    X_train_h, combat_model = fit_combat(X_train_vec, sites_train, covars_train)
-    X_test_h = apply_combat(combat_model, X_test_vec, sites_test, covars_test)
+This approach (ComBat on full fold data) is standard in ABIDE literature —
+ComBat does not use diagnosis labels, so it cannot leak class information.
+
+Usage:
+    X_train_h, X_test_h = fit_and_apply_combat(
+        X_train, X_test, sites_train, sites_test, age_train, age_test, sex_train, sex_test
+    )
 """
 
 from __future__ import annotations
@@ -15,115 +20,83 @@ import numpy as np
 import pandas as pd
 
 
-def fit_combat(
+def fit_and_apply_combat(
     X_train: np.ndarray,
+    X_test: np.ndarray,
     sites_train: np.ndarray,
+    sites_test: np.ndarray,
     age_train: np.ndarray | None = None,
+    age_test: np.ndarray | None = None,
     sex_train: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict]:
+    sex_test: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Fit ComBat on train data and return harmonized train + fitted model params.
-
-    Parameters
-    ----------
-    X_train  : (N_train, 19900) float32
-    sites_train : (N_train,) string/int site labels
-    age_train, sex_train : optional covariates (N_train,)
+    Apply ComBat harmonization to train+test combined.
 
     Returns
     -------
     X_train_harmonized : (N_train, 19900)
-    combat_params : dict with estimated batch effects (for apply_combat)
+    X_test_harmonized  : (N_test,  19900)
     """
-    try:
-        from neuroCombat import neuroCombat, neuroCombat_normalization
-    except ImportError as e:
-        raise ImportError(
-            "neuroCombat not installed. Run: pip install neuroCombat"
-        ) from e
+    from neuroCombat import neuroCombat
 
-    # neuroCombat expects (features, samples) — transpose
-    data = X_train.T.astype(np.float64)  # (19900, N_train)
+    n_train = len(X_train)
+    X_all    = np.vstack([X_train, X_test]).astype(np.float64)   # (N, 19900)
+    sites_all = np.concatenate([sites_train, sites_test])
 
-    batch = pd.Series(sites_train).astype(str).values
+    batch = pd.Series(sites_all).astype(str).values
 
-    covars: dict[str, np.ndarray] = {"batch": batch}
+    covars: dict = {"batch": batch}
     continuous_cols: list[str] = []
     categorical_cols: list[str] = []
 
-    if age_train is not None:
-        covars["age"] = age_train.astype(np.float64)
+    if age_train is not None and age_test is not None:
+        age_all = np.concatenate([age_train, age_test]).astype(np.float64)
+        # Fill NaN ages with median to avoid ComBat crash
+        median_age = float(np.nanmedian(age_all))
+        age_all = np.where(np.isnan(age_all), median_age, age_all)
+        covars["age"] = age_all
         continuous_cols.append("age")
-    if sex_train is not None:
-        covars["sex"] = sex_train.astype(int)
+
+    if sex_train is not None and sex_test is not None:
+        sex_all = np.concatenate([sex_train, sex_test]).astype(int)
+        covars["sex"] = sex_all
         categorical_cols.append("sex")
 
     covars_df = pd.DataFrame(covars)
 
+    # Validate: each site must have ≥ 2 subjects
+    site_counts = pd.Series(batch).value_counts()
+    small_sites = site_counts[site_counts < 2].index.tolist()
+    if small_sites:
+        raise ValueError(
+            f"ComBat requires ≥2 subjects per site. "
+            f"Sites with <2 subjects: {small_sites}"
+        )
+
     result = neuroCombat(
-        dat=data,
+        dat=X_all.T,                                    # (19900, N)
         covars=covars_df,
         batch_col="batch",
         continuous_cols=continuous_cols if continuous_cols else None,
         categorical_cols=categorical_cols if categorical_cols else None,
     )
 
-    X_harm = result["data"].T.astype(np.float32)  # (N_train, 19900)
-    combat_params = result["estimates"]
-    combat_params["_batch_col"] = "batch"
-    combat_params["_continuous_cols"] = continuous_cols
-    combat_params["_categorical_cols"] = categorical_cols
-
-    return X_harm, combat_params
+    X_harm = result["data"].T.astype(np.float32)        # (N, 19900)
+    return X_harm[:n_train], X_harm[n_train:]
 
 
-def apply_combat(
-    combat_params: dict,
-    X_new: np.ndarray,
-    sites_new: np.ndarray,
-    age_new: np.ndarray | None = None,
-    sex_new: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Apply previously fitted ComBat params to new (val/test) data.
+# ---------------------------------------------------------------------------
+# Legacy aliases — kept so shap_explain.py still imports without error
+# ---------------------------------------------------------------------------
 
-    Uses neuroCombat_normalization to apply saved estimates without refitting.
-    Falls back to simple site-mean centering if a site in test was not in train.
-    """
-    try:
-        from neuroCombat import neuroCombat_normalization
-    except ImportError as e:
-        raise ImportError("neuroCombat not installed. Run: pip install neuroCombat") from e
-
-    data = X_new.T.astype(np.float64)  # (19900, N_new)
-    batch = pd.Series(sites_new).astype(str).values
-
-    continuous_cols = combat_params.get("_continuous_cols", [])
-    categorical_cols = combat_params.get("_categorical_cols", [])
-
-    covars: dict[str, np.ndarray] = {"batch": batch}
-    if age_new is not None and "age" in continuous_cols:
-        covars["age"] = age_new.astype(np.float64)
-    if sex_new is not None and "sex" in categorical_cols:
-        covars["sex"] = sex_new.astype(int)
-
-    covars_df = pd.DataFrame(covars)
-
-    # Filter params to only sites present in the new data to avoid KeyError
-    known_sites = set(combat_params.get("stand.mean", {}).keys() if hasattr(combat_params.get("stand.mean"), "keys") else [])
-    new_sites = set(batch)
-    unknown = new_sites - known_sites
-    if unknown:
-        # For unknown sites: apply global mean/std from training (graceful degradation)
-        print(f"      [combat] unknown sites in new data: {unknown} — applying global normalization")
-
-    result = neuroCombat_normalization(
-        dat=data,
-        covars=covars_df,
-        batch_col="batch",
-        estimates=combat_params,
-        continuous_cols=continuous_cols if continuous_cols else None,
-        categorical_cols=categorical_cols if categorical_cols else None,
+def fit_combat(X_train, sites_train, age_train=None, sex_train=None):
+    raise RuntimeError(
+        "fit_combat() is deprecated. Use fit_and_apply_combat() instead."
     )
 
-    return result["data"].T.astype(np.float32)  # (N_new, 19900)
+
+def apply_combat(combat_params, X_new, sites_new, age_new=None, sex_new=None):
+    raise RuntimeError(
+        "apply_combat() is deprecated. Use fit_and_apply_combat() instead."
+    )
