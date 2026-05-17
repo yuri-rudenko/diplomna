@@ -20,3 +20,10 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local generated docs and archives
+CODEBASE.md
+*.zip
+
+# Cloud-compiled exports
+/compiled/

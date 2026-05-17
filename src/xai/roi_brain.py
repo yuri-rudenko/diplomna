@@ -11,10 +11,12 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 FIGURES_DIR = PROJECT_DIR / "results" / "figures"
 DATA_DIR = PROJECT_DIR / "data"
+EXPERIMENTS_DIR = PROJECT_DIR / "results" / "experiments"
 
 
 def _get_cc200_atlas():
@@ -85,7 +87,41 @@ def plot_brain_importance(
     print(f"  Saved stat map    → {out_stat}")
 
 
-def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0) -> None:
+def _resolve_fold(model_type: str, fold: str | int, exp_name: str | None = None) -> int:
+    """Return fold index, supporting literal int or 'best'."""
+    if isinstance(fold, int):
+        return fold
+    if str(fold).isdigit():
+        return int(fold)
+    if str(fold).lower() != "best":
+        raise ValueError(f"Unknown fold value: {fold}. Use int or 'best'.")
+
+    candidates = []
+    if exp_name:
+        candidates.append(EXPERIMENTS_DIR / exp_name / "metrics" / "cv_per_fold.csv")
+    candidates.append(PROJECT_DIR / "results" / "metrics" / "cv_per_fold.csv")
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        sub = df[df["model"] == model_type]
+        if exp_name and "experiment" in sub.columns:
+            sub = sub[sub["experiment"] == exp_name]
+        if not sub.empty:
+            return int(sub.loc[sub["auc"].idxmax(), "fold"])
+
+    raise FileNotFoundError(
+        "Could not auto-select best fold. "
+        "Provide --fold INT or ensure cv_per_fold.csv exists."
+    )
+
+
+def plot_attention_heatmap(
+    model_type: str = "attention_vae",
+    fold_idx: int = 0,
+    exp_name: str | None = None,
+) -> None:
     """
     Plot mean attention weights from the PatchAttention block.
     Loads a checkpoint and runs a few test samples through it.
@@ -112,9 +148,19 @@ def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0)
     X_test_vec, = apply_scaler(scaler, X_test_vec, X_test_vec)[1:2]  # only test
 
     model = AttentionVAE().to(device)
-    ckpt = PROJECT_DIR / "results" / "checkpoints" / f"attention_vae_fold{fold_idx}_best_auc.pth"
-    if not ckpt.exists():
-        print(f"Checkpoint not found: {ckpt}")
+    candidates = []
+    if exp_name:
+        candidates.append(
+            EXPERIMENTS_DIR / exp_name / "checkpoints" / f"{exp_name}_attention_vae_fold{fold_idx}_best_auc.pth"
+        )
+    # Backward-compatible path from older pipeline:
+    candidates.append(PROJECT_DIR / "results" / "checkpoints" / f"attention_vae_fold{fold_idx}_best_auc.pth")
+
+    ckpt = next((p for p in candidates if p.exists()), None)
+    if ckpt is None:
+        print("Checkpoint not found. Tried:")
+        for p in candidates:
+            print(f"  {p}")
         return
 
     model.load_state_dict(torch.load(ckpt, map_location=device))
@@ -147,16 +193,20 @@ def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="attention_vae")
-    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--fold", default="best",
+                        help="Fold index or 'best' (default: best)")
+    parser.add_argument("--exp", default=None,
+                        help="Experiment name for best-fold lookup and checkpoint path")
     args = parser.parse_args()
 
-    imp_path = FIGURES_DIR / f"roi_importance_{args.model}_fold{args.fold}.npy"
+    fold_idx = _resolve_fold(args.model, args.fold, exp_name=args.exp)
+    imp_path = FIGURES_DIR / f"roi_importance_{args.model}_fold{fold_idx}.npy"
     if not imp_path.exists():
         print(f"ROI importance file not found: {imp_path}")
         print("Run src.xai.shap_explain first.")
     else:
         roi_importance = np.load(imp_path)
-        plot_brain_importance(roi_importance, args.model, args.fold)
+        plot_brain_importance(roi_importance, args.model, fold_idx)
 
     if args.model == "attention_vae":
-        plot_attention_heatmap(args.model, args.fold)
+        plot_attention_heatmap(args.model, fold_idx, exp_name=args.exp)

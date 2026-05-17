@@ -119,13 +119,101 @@ def run_significance(
     return result
 
 
+def run_experiment_vs_experiment(
+    exp_a: str,
+    exp_b: str,
+    metric: str = "auc",
+) -> pd.DataFrame:
+    """
+    Compare two experiments for each model with paired fold-wise tests.
+
+    This is different from run_significance(), which compares model-vs-model.
+    """
+    df_a = _load_cv_data([exp_a])
+    df_b = _load_cv_data([exp_b])
+
+    rows = []
+    model_names = sorted(set(df_a["model"].unique()) | set(df_b["model"].unique()))
+
+    for model_name in model_names:
+        a_vals = df_a[df_a["model"] == model_name].sort_values("fold")[metric].values
+        b_vals = df_b[df_b["model"] == model_name].sort_values("fold")[metric].values
+
+        min_len = min(len(a_vals), len(b_vals))
+        if min_len < 2:
+            print(
+                f"  [warn] {model_name}: not enough paired folds for "
+                f"{exp_a} vs {exp_b} ({min_len}) — skipping"
+            )
+            continue
+
+        a_vals = a_vals[:min_len]
+        b_vals = b_vals[:min_len]
+
+        t_stat, p_val = stats.ttest_rel(a_vals, b_vals)
+
+        try:
+            w_stat, w_p = stats.wilcoxon(a_vals, b_vals)
+            w_stat = float(w_stat)
+            w_p = float(w_p)
+        except Exception:
+            w_stat, w_p = float("nan"), float("nan")
+
+        delta = float(b_vals.mean() - a_vals.mean())  # exp_b - exp_a
+        rows.append({
+            "model": model_name,
+            "metric": metric,
+            "experiment_a": exp_a,
+            "experiment_b": exp_b,
+            "n_folds": int(min_len),
+            f"mean_{exp_a}": float(a_vals.mean()),
+            f"mean_{exp_b}": float(b_vals.mean()),
+            "delta_b_minus_a": delta,
+            "t_stat": float(t_stat),
+            "p_value_ttest": float(p_val),
+            "wilcoxon_stat": w_stat,
+            "p_value_wilcoxon": w_p,
+            "significant_ttest_p05": bool(p_val < 0.05),
+            "significant_ttest_p01": bool(p_val < 0.01),
+        })
+
+    result = pd.DataFrame(rows)
+    out = METRICS_DIR / f"significance_{exp_a}_vs_{exp_b}_by_model.csv"
+    result.to_csv(out, index=False)
+
+    print(f"\nExperiment-vs-experiment paired tests ({metric}): {exp_a} vs {exp_b}")
+    if not result.empty:
+        print(
+            result[
+                ["model", "n_folds", "delta_b_minus_a", "p_value_ttest", "p_value_wilcoxon"]
+            ].to_string(index=False)
+        )
+    else:
+        print("  [warn] No comparable model/fold pairs found.")
+    print(f"\nSaved → {out}")
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--metric", default="auc",
                         help="Metric column to test (default: auc)")
     parser.add_argument("--exp", nargs="+", default=None,
                         help="Experiment name(s) from run_experiments.py")
+    parser.add_argument("--exp-a", default=None,
+                        help="Experiment A for experiment-vs-experiment test")
+    parser.add_argument("--exp-b", default=None,
+                        help="Experiment B for experiment-vs-experiment test")
     args = parser.parse_args()
 
-    tag = "_".join(args.exp) if args.exp else ""
-    run_significance(metric=args.metric, exp_names=args.exp, tag=tag)
+    if args.exp_a or args.exp_b:
+        if not (args.exp_a and args.exp_b):
+            raise ValueError("Use both --exp-a and --exp-b together.")
+        run_experiment_vs_experiment(
+            exp_a=args.exp_a,
+            exp_b=args.exp_b,
+            metric=args.metric,
+        )
+    else:
+        tag = "_".join(args.exp) if args.exp else ""
+        run_significance(metric=args.metric, exp_names=args.exp, tag=tag)
