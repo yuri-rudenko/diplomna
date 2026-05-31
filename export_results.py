@@ -619,16 +619,19 @@ h(f"SAE parameters:           20,701,374")
 h(f"VAE parameters:           20,717,822")
 h(f"AttVAE parameters:        20,735,486")
 h("")
-if cp_all.exists():
-    best_model_bl = max(
-        [r for r in all_rows if r["experiment"] == "baseline" and r["model"] != "ensemble"],
-        key=lambda r: auc_val(r)
-    )
+baseline_singles = (
+    [r for r in all_rows if r["experiment"] == "baseline" and r["model"] != "ensemble"]
+    if cp_all.exists() else []
+)
+if baseline_singles:
+    best_model_bl = max(baseline_singles, key=lambda r: auc_val(r))
     h("BASELINE RESULTS:")
     h(f"  Best single model (AUC): {best_model_bl['model']} = {auc_val(best_model_bl):.4f}")
-    ens_bl_row = next(r for r in all_rows if r["experiment"] == "baseline" and r["model"] == "ensemble")
-    h(f"  Ensemble AUC:            {ens_bl_row['auc']}")
-    single_aucs = [auc_val(r) for r in all_rows if r["experiment"] == "baseline" and r["model"] != "ensemble"]
+    ens_bl_row = next((r for r in all_rows
+                       if r["experiment"] == "baseline" and r["model"] == "ensemble"), None)
+    if ens_bl_row:
+        h(f"  Ensemble AUC:            {ens_bl_row['auc']}")
+    single_aucs = [auc_val(r) for r in baseline_singles]
     h(f"  AUC range (all models):  {min(single_aucs):.4f} – {max(single_aucs):.4f}")
     h(f"  Max inter-model spread:  {max(single_aucs)-min(single_aucs):.4f}")
     h("")
