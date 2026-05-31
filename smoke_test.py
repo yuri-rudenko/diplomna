@@ -251,10 +251,17 @@ try:
     assert beta_schedule(0, warmup_epochs=30) == 0.0
     assert beta_schedule(30, warmup_epochs=30) == 1.0
     assert beta_schedule(100, warmup_epochs=30) == 1.0
-    assert cls_weight_schedule(0, phase1_epochs=30) == 0.0
-    assert cls_weight_schedule(30, phase1_epochs=30) == 5.0
+    # cls_weight stays 0 in phase 1, then ramps 0 -> max linearly over
+    # warmup_epochs (default 10) starting at phase1_epochs.
+    assert cls_weight_schedule(0,  phase1_epochs=30) == 0.0   # phase 1
+    assert cls_weight_schedule(29, phase1_epochs=30) == 0.0   # still phase 1
+    assert cls_weight_schedule(30, phase1_epochs=30) == 0.0   # phase-2 ramp starts at 0
+    assert cls_weight_schedule(35, phase1_epochs=30) == 2.5   # halfway up the 10-epoch ramp
+    assert cls_weight_schedule(40, phase1_epochs=30) == 5.0   # ramp complete
+    assert cls_weight_schedule(100, phase1_epochs=30) == 5.0  # stable at max
     print(f"  beta(0)={beta_schedule(0,30):.1f}  beta(15)={beta_schedule(15,30):.2f}  beta(30)={beta_schedule(30,30):.1f}")
-    print(f"  cls_w(0)={cls_weight_schedule(0,30):.1f}  cls_w(30)={cls_weight_schedule(30,30):.1f}")
+    print(f"  cls_w(30)={cls_weight_schedule(30,30):.1f}  cls_w(35)={cls_weight_schedule(35,30):.1f}  "
+          f"cls_w(40)={cls_weight_schedule(40,30):.1f}")
     print(f"{PASS} Schedules OK")
 except Exception:
     traceback.print_exc()
