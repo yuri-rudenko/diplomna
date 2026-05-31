@@ -18,9 +18,22 @@ DATA_DIR = PROJECT_DIR / "data"
 
 
 def _get_cc200_atlas():
-    """Fetch CC200 atlas NIfTI via nilearn (cached after first download)."""
+    """Fetch CC200 atlas NIfTI via nilearn (cached after first download).
+
+    Uses the SSL-robust fetch wrapper: nitrc.org (the Craddock host) ships an
+    invalid certificate, so a plain fetch fails. robust_fetch clears any
+    half-written cache and retries with TLS verification disabled.
+    """
     from nilearn import datasets
-    atlas = datasets.fetch_atlas_craddock_2012(data_dir=str(DATA_DIR / "craddock_2012"))
+
+    from src.utils.atlas_fetch import robust_fetch
+
+    cdir = DATA_DIR / "craddock_2012"
+    atlas = robust_fetch(
+        datasets.fetch_atlas_craddock_2012,
+        data_dir=str(cdir),
+        partial_dirs=[cdir],
+    )
     # The scorr_mean parcellation is the 200-ROI version used in ABIDE
     return atlas.scorr_mean
 
@@ -85,7 +98,11 @@ def plot_brain_importance(
     print(f"  Saved stat map    → {out_stat}")
 
 
-def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0) -> None:
+def plot_attention_heatmap(
+    model_type: str = "attention_vae",
+    fold_idx: int = 0,
+    exp_name: str | None = None,
+) -> None:
     """
     Plot mean attention weights from the PatchAttention block.
     Loads a checkpoint and runs a few test samples through it.
@@ -97,6 +114,7 @@ def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0)
     from src.data.preprocessing import fit_scaler, apply_scaler, vectorize
     from src.data.splits import load_splits
     from src.models.attention_vae import AttentionVAE
+    from src.utils.checkpoints import resolve_checkpoint
 
     if model_type != "attention_vae":
         print("Attention heatmap only available for attention_vae")
@@ -112,9 +130,9 @@ def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0)
     X_test_vec, = apply_scaler(scaler, X_test_vec, X_test_vec)[1:2]  # only test
 
     model = AttentionVAE().to(device)
-    ckpt = PROJECT_DIR / "results" / "checkpoints" / f"attention_vae_fold{fold_idx}_best_auc.pth"
-    if not ckpt.exists():
-        print(f"Checkpoint not found: {ckpt}")
+    ckpt = resolve_checkpoint("attention_vae", fold_idx, exp_name)
+    if ckpt is None:
+        print(f"Checkpoint not found for attention_vae fold {fold_idx} (exp={exp_name})")
         return
 
     model.load_state_dict(torch.load(ckpt, map_location=device))
@@ -145,18 +163,26 @@ def plot_attention_heatmap(model_type: str = "attention_vae", fold_idx: int = 0)
 
 
 if __name__ == "__main__":
+    from src.utils.checkpoints import resolve_fold
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="attention_vae")
-    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--fold", default="0",
+                        help="Fold index or 'best' (default: 0)")
+    parser.add_argument("--exp", default=None,
+                        help="Experiment name from run_experiments.py (e.g. aug_full). "
+                             "Resolves checkpoints from results/experiments/{exp}/checkpoints/")
     args = parser.parse_args()
 
-    imp_path = FIGURES_DIR / f"roi_importance_{args.model}_fold{args.fold}.npy"
+    fold_idx = resolve_fold(args.fold, args.model, args.exp)
+
+    imp_path = FIGURES_DIR / f"roi_importance_{args.model}_fold{fold_idx}.npy"
     if not imp_path.exists():
         print(f"ROI importance file not found: {imp_path}")
-        print("Run src.xai.shap_explain first.")
+        print("Run src.xai.shap_explain (or src.xai.run_xai) first.")
     else:
         roi_importance = np.load(imp_path)
-        plot_brain_importance(roi_importance, args.model, args.fold)
+        plot_brain_importance(roi_importance, args.model, fold_idx)
 
     if args.model == "attention_vae":
-        plot_attention_heatmap(args.model, args.fold)
+        plot_attention_heatmap(args.model, fold_idx, exp_name=args.exp)

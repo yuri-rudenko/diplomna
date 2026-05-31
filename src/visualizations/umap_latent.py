@@ -66,9 +66,10 @@ def extract_mu(
 
 def plot_umap_latent(
     model_name: str,
-    fold_idx: int,
+    fold,
     n_neighbors: int = 15,
     min_dist: float = 0.1,
+    exp_name: str | None = None,
 ) -> None:
     import umap as umap_lib
 
@@ -76,6 +77,10 @@ def plot_umap_latent(
     from src.data.preprocessing import apply_scaler, fit_scaler, vectorize
     from src.data.splits import load_splits
     from src.data.dataset import ABIDEDataset
+    from src.utils.checkpoints import resolve_checkpoint, resolve_fold, resolve_scaler
+
+    model_type, class_name = MODEL_CONFIGS[model_name]
+    fold_idx = resolve_fold(fold, model_type, exp_name)
 
     # ---- load data & scaler ------------------------------------------------
     X_raw, pheno = load_processed()
@@ -87,8 +92,8 @@ def plot_umap_latent(
     y_test = pheno["label"].values[test_idx]
 
     import joblib
-    _scaler_path = PROJECT_DIR / "data" / "processed" / f"scaler_fold{fold_idx}.pkl"
-    if _scaler_path.exists():
+    _scaler_path = resolve_scaler(fold_idx, exp_name)
+    if _scaler_path is not None:
         scaler = joblib.load(_scaler_path)
     else:
         scaler = fit_scaler(X_train_vec)
@@ -100,7 +105,6 @@ def plot_umap_latent(
 
     # ---- load model --------------------------------------------------------
     device = torch.device("cpu")
-    model_type, class_name = MODEL_CONFIGS[model_name]
 
     if class_name == "VariationalAutoencoder":
         from src.models.vae import VariationalAutoencoder
@@ -109,9 +113,10 @@ def plot_umap_latent(
         from src.models.attention_vae import AttentionVAE
         model = AttentionVAE()
 
-    ckpt = CKPT_DIR / f"{model_name}_fold{fold_idx}_best_auc.pth"
-    if not ckpt.exists():
-        print(f"  [skip] checkpoint not found: {ckpt}")
+    ckpt = resolve_checkpoint(model_name, fold_idx, exp_name)
+    if ckpt is None:
+        print(f"  [skip] checkpoint not found for {model_name} fold {fold_idx} "
+              f"(exp={exp_name})")
         return
     model.load_state_dict(torch.load(ckpt, map_location=device))
     model.to(device)
@@ -160,7 +165,7 @@ def plot_umap_latent(
 # Combined 2-panel figure: VAE + Attention-VAE side by side
 # ---------------------------------------------------------------------------
 
-def plot_umap_combined(fold_idx: int) -> None:
+def plot_umap_combined(fold, exp_name: str | None = None) -> None:
     """Side-by-side UMAP for VAE and Attention-VAE on the same fold."""
     import umap as umap_lib
     import joblib
@@ -171,6 +176,10 @@ def plot_umap_combined(fold_idx: int) -> None:
     from src.data.dataset import ABIDEDataset
     from src.models.vae import VariationalAutoencoder
     from src.models.attention_vae import AttentionVAE
+    from src.utils.checkpoints import resolve_checkpoint, resolve_fold, resolve_scaler
+
+    # Both panels share one fold; resolve 'best' against the VAE's metrics.
+    fold_idx = resolve_fold(fold, "vae", exp_name)
 
     X_raw, pheno = load_processed()
     folds = load_splits()
@@ -180,8 +189,8 @@ def plot_umap_combined(fold_idx: int) -> None:
     X_test_vec  = vectorize(X_raw[test_idx])
     y_test = pheno["label"].values[test_idx]
 
-    _scaler_path = PROJECT_DIR / "data" / "processed" / f"scaler_fold{fold_idx}.pkl"
-    scaler = joblib.load(_scaler_path) if _scaler_path.exists() else fit_scaler(X_train_vec)
+    _scaler_path = resolve_scaler(fold_idx, exp_name)
+    scaler = joblib.load(_scaler_path) if _scaler_path is not None else fit_scaler(X_train_vec)
     _, X_test_n = apply_scaler(scaler, X_train_vec, X_test_vec)
 
     test_ds     = ABIDEDataset(X_test_n, y_test)
@@ -196,8 +205,8 @@ def plot_umap_combined(fold_idx: int) -> None:
     ]
 
     for name, model, ax in model_pairs:
-        ckpt = CKPT_DIR / f"{name}_fold{fold_idx}_best_auc.pth"
-        if not ckpt.exists():
+        ckpt = resolve_checkpoint(name, fold_idx, exp_name)
+        if ckpt is None:
             ax.set_visible(False)
             continue
 
@@ -240,14 +249,18 @@ if __name__ == "__main__":
         default=["vae", "attention_vae"],
         choices=["vae", "attention_vae"],
     )
-    parser.add_argument("--fold", type=int, default=0,
-                        help="Fold index (default: 0)")
+    parser.add_argument("--fold", default="0",
+                        help="Fold index or 'best' (default: 0)")
+    parser.add_argument("--exp", default=None,
+                        help="Experiment name from run_experiments.py (e.g. aug_full). "
+                             "Resolves checkpoints/scalers from "
+                             "results/experiments/{exp}/checkpoints/")
     parser.add_argument("--combined", action="store_true",
                         help="Also generate side-by-side combined figure")
     args = parser.parse_args()
 
     for m in args.models:
-        plot_umap_latent(m, args.fold)
+        plot_umap_latent(m, args.fold, exp_name=args.exp)
 
     if args.combined or len(args.models) >= 2:
-        plot_umap_combined(args.fold)
+        plot_umap_combined(args.fold, exp_name=args.exp)

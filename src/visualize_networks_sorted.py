@@ -94,15 +94,24 @@ def build_cc200_to_network() -> List[str]:
     """Return a list of length ``N_ROIS`` mapping ROI index → network name."""
     print("[1/4] Building CC200 → Yeo-7 network mapping ...")
 
+    from src.utils.atlas_fetch import robust_fetch
+
     # CC200 labelmap (idx 19 = ~200-cluster solution, see visualize_brain.py).
-    craddock = datasets.fetch_atlas_craddock_2012(data_dir=str(DATA_DIR))
+    # nitrc.org ships an invalid cert → fetch via the SSL-robust wrapper.
+    craddock = robust_fetch(
+        datasets.fetch_atlas_craddock_2012,
+        data_dir=str(DATA_DIR),
+        partial_dirs=[DATA_DIR / "craddock_2012"],
+    )
     cc_img = image.index_img(craddock["maps"], 19)
     cc_data = cc_img.get_fdata().astype(int)
 
     # Schaefer 2018, 400 parcels, 7 networks, MNI152 2mm.
-    sch = datasets.fetch_atlas_schaefer_2018(
+    sch = robust_fetch(
+        datasets.fetch_atlas_schaefer_2018,
         n_rois=400, yeo_networks=7, resolution_mm=2,
         data_dir=str(DATA_DIR),
+        partial_dirs=[DATA_DIR / "schaefer_2018"],
     )
     sch_img_native = image.load_img(sch["maps"])
 
