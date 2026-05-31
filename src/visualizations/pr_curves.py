@@ -26,11 +26,12 @@ from sklearn.metrics import average_precision_score, precision_recall_curve
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 EXPERIMENTS_DIR = PROJECT_DIR / "results" / "experiments"
 
-MODEL_NAMES = ["sae", "vae", "attention_vae", "ensemble"]
+MODEL_NAMES = ["sae", "vae", "attention_vae", "logreg", "ensemble"]
 MODEL_COLORS = {
     "sae": "#1f77b4",
     "vae": "#ff7f0e",
     "attention_vae": "#2ca02c",
+    "logreg": "#9467bd",
     "ensemble": "#d62728",
 }
 

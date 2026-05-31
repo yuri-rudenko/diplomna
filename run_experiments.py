@@ -272,7 +272,52 @@ def train_experiment(
 # Run one full experiment (all models, all folds)
 # ---------------------------------------------------------------------------
 
-MODEL_NAMES = ["sae", "vae", "attention_vae"]
+DEEP_MODELS = ["sae", "vae", "attention_vae"]   # deep models (latent space, history, SHAP)
+MODEL_NAMES = DEEP_MODELS + ["logreg"]          # all per-fold models (logreg = classical baseline)
+
+
+def fit_logreg_baseline(
+    X_train_vec: np.ndarray,
+    y_train: np.ndarray,
+    X_test_vec: np.ndarray,
+    y_test: np.ndarray,
+) -> tuple[dict, np.ndarray]:
+    """Classical Logistic-Regression baseline.
+
+    A fresh StandardScaler is fit on the FULL train fold (classical models need
+    no validation split and do no test-based model selection, so this is
+    leakage-free). Returns (metrics_dict, test_probs); metric formulas match
+    src.training.trainer.evaluate so the row is directly comparable.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import (
+        balanced_accuracy_score, f1_score, roc_auc_score,
+    )
+
+    y_train = np.asarray(y_train)
+    y_test = np.asarray(y_test)
+
+    scaler = StandardScaler().fit(X_train_vec)
+    X_tr = scaler.transform(X_train_vec)
+    X_te = scaler.transform(X_test_vec)
+
+    clf = LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")
+    clf.fit(X_tr, y_train)
+    probs = clf.predict_proba(X_te)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+
+    metrics = {
+        "auc":          float(roc_auc_score(y_test, probs)),
+        "f1":           float(f1_score(y_test, preds, zero_division=0)),
+        "balanced_acc": float(balanced_accuracy_score(y_test, preds)),
+        "acc":          float((preds == y_test).mean()),
+        "sensitivity":  float(((preds == 1) & (y_test == 1)).sum()
+                              / max((y_test == 1).sum(), 1)),
+        "specificity":  float(((preds == 0) & (y_test == 0)).sum()
+                              / max((y_test == 0).sum(), 1)),
+    }
+    return metrics, probs
 
 
 def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
@@ -405,6 +450,22 @@ def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
 
         for model_name in MODEL_NAMES:
             tag = f"{cfg.name}_{model_name}_fold{k}"
+
+            # ── Classical baseline: sklearn path, no checkpoint/history/epochs ──
+            if model_name == "logreg":
+                lr_metrics, lr_probs = fit_logreg_baseline(
+                    vectorize(X_raw[train_idx]), y_train_full,
+                    vectorize(X_raw[test_idx]),  y_test,
+                )
+                row = dict(lr_metrics)
+                row.update({"experiment": cfg.name, "model": "logreg", "fold": k})
+                all_rows.append(row)
+                np.save(figs_dir / f"probs_{tag}.npy",  lr_probs)
+                np.save(figs_dir / f"labels_{tag}.npy", y_test)
+                print(f"  logreg fold {k} → AUC={lr_metrics['auc']:.4f}  "
+                      f"F1={lr_metrics['f1']:.4f}  BalAcc={lr_metrics['balanced_acc']:.4f}")
+                continue  # excluded from fold_probs → not in the deep ensemble
+
             model, model_type = make_model(model_name, cfg)
 
             train_ds = ABIDEDataset(X_train_n, y_train,
@@ -440,8 +501,8 @@ def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
                   f"AUC={metrics['auc']:.4f}  F1={metrics['f1']:.4f}  "
                   f"BalAcc={metrics['balanced_acc']:.4f}")
 
-        # Ensemble
-        ens_probs  = np.mean(list(fold_probs.values()), axis=0)
+        # Ensemble — mean of the three DEEP models' test probs only (logreg excluded)
+        ens_probs  = np.mean([fold_probs[m] for m in DEEP_MODELS], axis=0)
         ens_labels = np.load(figs_dir / f"labels_{cfg.name}_sae_fold{k}.npy")
         ens_preds  = (ens_probs >= 0.5).astype(int)
         from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score
@@ -570,7 +631,8 @@ def plot_experiment(exp_name: str, n_cv: int = 5) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_names = MODEL_NAMES + ["ensemble"]
     colors = {"sae": "#1f77b4", "vae": "#ff7f0e",
-               "attention_vae": "#2ca02c", "ensemble": "#d62728"}
+               "attention_vae": "#2ca02c", "logreg": "#9467bd",
+               "ensemble": "#d62728"}
 
     # ── 1. ROC curves ────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -665,7 +727,8 @@ def plot_experiment(exp_name: str, n_cv: int = 5) -> None:
         print(f"  Saved confusion_matrices.png")
 
     # ── 4. Training curves ───────────────────────────────────────────────────
-    hist_models = [m for m in MODEL_NAMES
+    # Deep models only — logreg has no training history.
+    hist_models = [m for m in DEEP_MODELS
                    if (ckpt_dir / f"{exp_name}_{m}_fold0_history.json").exists()]
     if hist_models:
         fig4, axes4 = plt.subplots(2, len(hist_models),

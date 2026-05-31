@@ -40,12 +40,18 @@ METRICS_DIR = PROJECT_DIR / "results" / "metrics"
 PROCESSED_DIR = PROJECT_DIR / "data" / "processed"
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_NAMES  = ["sae", "vae", "attention_vae"]
-MODEL_LABELS = {"sae": "SAE", "vae": "VAE", "attention_vae": "Attention-VAE"}
+# Deep models (latent space / training history / deep-SHAP). logreg is a
+# classical baseline: it appears in AUC/ROC/score charts but NOT in
+# training-curve or SHAP charts.
+DEEP_MODELS  = ["sae", "vae", "attention_vae"]
+MODEL_NAMES  = ["sae", "vae", "attention_vae", "logreg"]
+MODEL_LABELS = {"sae": "SAE", "vae": "VAE",
+                "attention_vae": "Attention-VAE", "logreg": "LogReg"}
 MODEL_COLORS = {
     "sae":           "#e15759",
     "vae":           "#4e79a7",
     "attention_vae": "#59a14f",
+    "logreg":        "#9467bd",
     "ensemble":      "#f28e2b",
 }
 YEO7_COLORS = {
@@ -237,7 +243,7 @@ def plot_shap_network_pie() -> None:
     """Pie charts showing Yeo-7 network distribution in top-20 ROIs per model."""
     model_csvs: dict[str, list[pd.DataFrame]] = {}
     for csv_path in sorted(FIGURES_DIR.glob("shap_top20_*.csv")):
-        for mname in MODEL_NAMES:
+        for mname in DEEP_MODELS:   # SHAP is deep-only
             if f"_{mname}_" in csv_path.name or csv_path.name.endswith(f"_{mname}.csv"):
                 model_csvs.setdefault(mname, []).append(pd.read_csv(csv_path))
 
@@ -291,7 +297,7 @@ def plot_training_curves_detailed(
         print(f"  [skip] training curves — {ckpt_dir} not found")
         return
 
-    for mname in MODEL_NAMES:
+    for mname in DEEP_MODELS:   # logreg has no training history
         histories = []
         for k in range(n_cv):
             hist_path = ckpt_dir / f"{exp_name}_{mname}_fold{k}_history.json"

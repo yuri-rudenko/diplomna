@@ -301,6 +301,44 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
+# 9. LogReg baseline + train/val/test split (no-leakage plumbing)
+# ---------------------------------------------------------------------------
+section("9. LogReg baseline + train/val/test split")
+
+try:
+    from sklearn.model_selection import train_test_split
+    from run_experiments import fit_logreg_baseline
+
+    tr, te = folds[0]
+
+    # Stratified train_sub/val split mirroring run_experiment — the test fold
+    # is never mixed into train or val (no model selection on test).
+    sub_pos, val_pos = train_test_split(
+        np.arange(len(tr)), test_size=0.15, stratify=y[tr], random_state=42,
+    )
+    train_sub, val_sub = tr[sub_pos], tr[val_pos]
+    assert set(train_sub.tolist()) & set(val_sub.tolist()) == set()
+    assert set(val_sub.tolist())   & set(te.tolist())      == set()
+    assert set(train_sub.tolist()) & set(te.tolist())      == set()
+    print(f"  split sizes — train_sub={len(train_sub)} val={len(val_sub)} test={len(te)}")
+
+    # LogReg classical baseline: fit on the FULL train fold, evaluate on test.
+    X_tr_full = vectorize(X[tr])
+    X_te_vec  = vectorize(X[te])
+    lr_metrics, lr_probs = fit_logreg_baseline(X_tr_full, y[tr], X_te_vec, y[te])
+    assert lr_probs.shape == (len(te),)
+    assert {"auc", "f1", "balanced_acc", "acc", "sensitivity", "specificity"} <= set(lr_metrics)
+    assert 0.0 <= lr_metrics["auc"] <= 1.0 and np.isfinite(lr_probs).all()
+    print(f"  logreg: AUC={lr_metrics['auc']:.4f}  F1={lr_metrics['f1']:.4f}  "
+          f"BalAcc={lr_metrics['balanced_acc']:.4f}")
+    print(f"{PASS} LogReg baseline + split OK")
+except Exception:
+    traceback.print_exc()
+    print(f"{FAIL} LogReg baseline + split")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section("SUMMARY")
