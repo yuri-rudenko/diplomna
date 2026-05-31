@@ -18,13 +18,18 @@ DATA_DIR = PROJECT_DIR / "data"
 
 
 def _get_cc200_atlas():
-    """Fetch CC200 atlas NIfTI via nilearn (cached after first download).
+    """Return the CC200 (~200-ROI) labelmap as a 3D NIfTI image.
 
     Uses the SSL-robust fetch wrapper: nitrc.org (the Craddock host) ships an
     invalid certificate, so a plain fetch fails. robust_fetch clears any
     half-written cache and retries with TLS verification disabled.
+
+    Current nilearn returns a single 4D ``maps`` image holding all 43 cluster
+    solutions (the old per-metric keys like ``scorr_mean`` were removed);
+    volume index 19 is the ~200-cluster solution used throughout this project
+    (see visualize_networks_sorted.py).
     """
-    from nilearn import datasets
+    from nilearn import datasets, image
 
     from src.utils.atlas_fetch import robust_fetch
 
@@ -34,28 +39,32 @@ def _get_cc200_atlas():
         data_dir=str(cdir),
         partial_dirs=[cdir],
     )
-    # The scorr_mean parcellation is the 200-ROI version used in ABIDE
-    return atlas.scorr_mean
+    maps = getattr(atlas, "maps", None)
+    if maps is None:
+        maps = atlas["maps"]
+    return image.index_img(maps, 19)   # 3D labelmap, integer ROI labels 1..200
 
 
-def roi_importance_to_brain_img(roi_importance: np.ndarray, atlas_img_path: str):
+def roi_importance_to_brain_img(roi_importance: np.ndarray, atlas_img):
     """
     Map (200,) ROI importance values onto CC200 atlas voxels.
 
+    ``atlas_img`` may be a path or an already-loaded 3D NIfTI labelmap.
     Returns a NIfTI stat map with voxel values = importance of the ROI it belongs to.
     """
     import nibabel as nib
     import numpy as np
 
-    atlas_img = nib.load(atlas_img_path)
-    atlas_data = atlas_img.get_fdata()
-    stat_data = np.zeros_like(atlas_data, dtype=np.float32)
+    if isinstance(atlas_img, (str, Path)):
+        atlas_img = nib.load(str(atlas_img))
+    atlas_data = np.asarray(atlas_img.get_fdata()).astype(int)
+    stat_data = np.zeros(atlas_data.shape, dtype=np.float32)
 
     for roi_idx in range(len(roi_importance)):
         label = roi_idx + 1  # CC200 labels are 1-indexed
         stat_data[atlas_data == label] = roi_importance[roi_idx]
 
-    return nib.Nifti1Image(stat_data, atlas_img.affine, atlas_img.header)
+    return nib.Nifti1Image(stat_data, atlas_img.affine)
 
 
 def plot_brain_importance(
