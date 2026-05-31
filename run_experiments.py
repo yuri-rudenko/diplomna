@@ -39,6 +39,7 @@ from src.data.harmonize import fit_and_apply_combat
 from src.data.preprocessing import apply_scaler, fit_scaler, vectorize
 from src.data.splits import load_splits
 from src.experiments import EXPERIMENTS, ExperimentConfig
+from sklearn.model_selection import train_test_split
 from src.models.attention_vae import AttentionVAE
 from src.models.sparse_ae import SparseAutoencoder
 from src.models.vae import VariationalAutoencoder
@@ -320,47 +321,77 @@ def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
         print(f"  FOLD {k+1}/{n_cv}")
         print(f"  {'='*50}")
 
-        X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
-        y_train = pheno["label"].values[train_idx]
-        y_test  = pheno["label"].values[test_idx]
+        # ── No-leakage split ───────────────────────────────────────────────
+        # The test fold is held out for the FINAL evaluation only. Carve a
+        # stratified validation set out of the train fold for early stopping
+        # and checkpoint selection, so the test set never influences training.
+        y_train_full = pheno["label"].values[train_idx]
+        y_test = pheno["label"].values[test_idx]
 
-        X_train_vec = vectorize(X_train_raw)
-        X_test_vec  = vectorize(X_test_raw)
+        sub_pos, val_pos = train_test_split(
+            np.arange(len(train_idx)),
+            test_size=0.15,
+            stratify=y_train_full,
+            random_state=42,
+        )
+        train_sub_idx = train_idx[sub_pos]
+        val_sub_idx   = train_idx[val_pos]
+        y_train = y_train_full[sub_pos]
+        y_val   = y_train_full[val_pos]
 
-        # ComBat
+        X_train_vec = vectorize(X_raw[train_sub_idx])
+        X_val_vec   = vectorize(X_raw[val_sub_idx])
+        X_test_vec  = vectorize(X_raw[test_idx])
+
+        # ComBat — fit on train_sub only; apply to val + test (concatenated as
+        # the "test" group of fit_and_apply_combat, then split back). ComBat is
+        # label-free so it cannot leak diagnosis information.
         if cfg.harmonize:
             try:
-                sites_tr = pheno["site"].values[train_idx]
-                sites_te = pheno["site"].values[test_idx]
-                X_train_vec, X_test_vec = fit_and_apply_combat(
-                    X_train_vec, X_test_vec,
-                    sites_tr, sites_te,
-                    pheno["age"].values[train_idx], pheno["age"].values[test_idx],
-                    pheno["sex"].values[train_idx], pheno["sex"].values[test_idx],
+                n_val = len(X_val_vec)
+                X_vt_vec = np.vstack([X_val_vec, X_test_vec])
+                sites_vt = np.concatenate([pheno["site"].values[val_sub_idx],
+                                           pheno["site"].values[test_idx]])
+                age_vt = np.concatenate([pheno["age"].values[val_sub_idx],
+                                         pheno["age"].values[test_idx]])
+                sex_vt = np.concatenate([pheno["sex"].values[val_sub_idx],
+                                         pheno["sex"].values[test_idx]])
+                X_train_vec, X_vt_vec = fit_and_apply_combat(
+                    X_train_vec, X_vt_vec,
+                    pheno["site"].values[train_sub_idx], sites_vt,
+                    pheno["age"].values[train_sub_idx],  age_vt,
+                    pheno["sex"].values[train_sub_idx],  sex_vt,
                 )
-                print(f"  [combat] OK — train={X_train_vec.shape} test={X_test_vec.shape}")
+                X_val_vec, X_test_vec = X_vt_vec[:n_val], X_vt_vec[n_val:]
+                print(f"  [combat] OK — train={X_train_vec.shape} "
+                      f"val={X_val_vec.shape} test={X_test_vec.shape}")
             except Exception:
                 print("  [combat] FAILED:")
                 traceback.print_exc()
                 print("  [combat] continuing without harmonization")
 
+        # StandardScaler fit on train_sub only; transform val + test.
         scaler = fit_scaler(X_train_vec)
-        X_train_n, X_test_n = apply_scaler(scaler, X_train_vec, X_test_vec)
+        X_train_n, X_val_n, X_test_n = apply_scaler(
+            scaler, X_train_vec, X_test_vec, X_val_vec
+        )
 
-        # Save scaler — needed by shap_explain.py
+        # Save scaler — needed by shap_explain.py / umap_latent.py
         import joblib as _jl
         _scaler_path = ckpt_dir / f"scaler_fold{k}.pkl"
         _jl.dump(scaler, _scaler_path)
 
-        # Save fold metadata (train/test sizes, ASD balance)
+        # Save fold metadata (train_sub/val/test sizes, ASD balance)
         y_all = pheno["label"].values
         fold_meta = {
             "fold":       k,
-            "train_size": int(len(train_idx)),
+            "train_size": int(len(train_sub_idx)),
+            "val_size":   int(len(val_sub_idx)),
             "test_size":  int(len(test_idx)),
-            "train_asd_pct": float(y_all[train_idx].mean()),
+            "train_asd_pct": float(y_all[train_sub_idx].mean()),
+            "val_asd_pct":   float(y_all[val_sub_idx].mean()),
             "test_asd_pct":  float(y_all[test_idx].mean()),
-            "train_sites":   sorted(pheno["site"].iloc[train_idx].unique().tolist()),
+            "train_sites":   sorted(pheno["site"].iloc[train_sub_idx].unique().tolist()),
             "test_sites":    sorted(pheno["site"].iloc[test_idx].unique().tolist()),
         }
         all_fold_meta = json.loads(
@@ -378,15 +409,19 @@ def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
 
             train_ds = ABIDEDataset(X_train_n, y_train,
                                     augment=cfg.augment, noise_std=cfg.noise_std)
+            val_ds   = ABIDEDataset(X_val_n,   y_val,   augment=False)
             test_ds  = ABIDEDataset(X_test_n,  y_test,  augment=False)
             train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, drop_last=True)
+            val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False)
             test_loader  = DataLoader(test_ds,  batch_size=32, shuffle=False)
 
             print(f"\n  --- {model_name} fold {k} ---")
-            train_experiment(model, model_type, train_loader, test_loader,
+            # Early stopping + checkpoint selection on the VALIDATION set only —
+            # the test set is never seen during training/model selection.
+            train_experiment(model, model_type, train_loader, val_loader,
                              cfg, tag, ckpt_dir, device)
 
-            # Load best checkpoint for evaluation
+            # Load the val-selected best checkpoint, evaluate ONCE on test.
             ckpt = ckpt_dir / f"{tag}_best_auc.pth"
             model.load_state_dict(torch.load(ckpt, map_location=device))
             model.to(device)
