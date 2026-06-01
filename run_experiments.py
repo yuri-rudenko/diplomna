@@ -453,9 +453,27 @@ def run_experiment(cfg: ExperimentConfig, n_cv: int = 5) -> pd.DataFrame:
 
             # ── Classical baseline: sklearn path, no checkpoint/history/epochs ──
             if model_name == "logreg":
+                lr_tr_vec = vectorize(X_raw[train_idx])
+                lr_te_vec = vectorize(X_raw[test_idx])
+                # Respect the experiment's ComBat setting so the 'combat'
+                # experiment harmonizes logreg too. ComBat is fit on the FULL
+                # train fold and applied to test; it is label-free, so this is
+                # leakage-free and keeps logreg comparable to the deep models.
+                if cfg.harmonize:
+                    try:
+                        lr_tr_vec, lr_te_vec = fit_and_apply_combat(
+                            lr_tr_vec, lr_te_vec,
+                            pheno["site"].values[train_idx], pheno["site"].values[test_idx],
+                            pheno["age"].values[train_idx],  pheno["age"].values[test_idx],
+                            pheno["sex"].values[train_idx],  pheno["sex"].values[test_idx],
+                        )
+                        print(f"  [combat/logreg] OK — train={lr_tr_vec.shape} test={lr_te_vec.shape}")
+                    except Exception:
+                        print("  [combat/logreg] FAILED — using raw features")
+                        traceback.print_exc()
                 lr_metrics, lr_probs = fit_logreg_baseline(
-                    vectorize(X_raw[train_idx]), y_train_full,
-                    vectorize(X_raw[test_idx]),  y_test,
+                    lr_tr_vec, y_train_full,
+                    lr_te_vec, y_test,
                 )
                 row = dict(lr_metrics)
                 row.update({"experiment": cfg.name, "model": "logreg", "fold": k})

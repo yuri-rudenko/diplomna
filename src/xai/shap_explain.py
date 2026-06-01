@@ -244,21 +244,27 @@ def _get_cc200_networks() -> list[str]:
     if _CC200_NETWORKS_CACHE is not None:
         return _CC200_NETWORKS_CACHE
 
-    # Cache file so we don't recompute every run
-    cache_path = PROJECT_DIR / "data" / "processed" / "cc200_networks.json"
-    if cache_path.exists():
-        import json
-        with open(cache_path) as f:
-            _CC200_NETWORKS_CACHE = json.load(f)
-        return _CC200_NETWORKS_CACHE
+    import json
+    # Candidate cache locations, in priority order:
+    #   1. runtime cache under data/processed/ (gitignored, may not exist)
+    #   2. the precomputed mapping shipped under src/data/ — tracked in git, so
+    #      it is ALWAYS present on a fresh checkout (Colab/Kaggle/GCP). This
+    #      keeps the fragile atlas download off the critical path; without it a
+    #      failed download silently falls back to "Unknown" for all 200 ROIs.
+    runtime_cache = PROJECT_DIR / "data" / "processed" / "cc200_networks.json"
+    shipped_cache = PROJECT_DIR / "src" / "data" / "cc200_networks.json"
+    for cache_path in (runtime_cache, shipped_cache):
+        if cache_path.exists():
+            with open(cache_path) as f:
+                _CC200_NETWORKS_CACHE = json.load(f)
+            return _CC200_NETWORKS_CACHE
 
     try:
         print("  Building CC200→Yeo-7 network mapping (one-time, ~30s) ...")
         from src.visualize_networks_sorted import build_cc200_to_network
         networks = build_cc200_to_network()
-        import json
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w") as f:
+        runtime_cache.parent.mkdir(parents=True, exist_ok=True)
+        with open(runtime_cache, "w") as f:
             json.dump(networks, f)
         _CC200_NETWORKS_CACHE = networks
         return networks
